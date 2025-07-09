@@ -34,7 +34,7 @@ KEYWORDS = [
     'VP of Financial Planning & Analysis (FP&A)', 'VP of Corporate Finance', 'Head of Finance',
     'Head of FP&A', 'Head of Corporate Finance', 'Director of Finance',
     'Director of Financial Planning & Analysis', 'Director of Corporate Finance',
-    'Controller / Financial Controller'
+    'Controller', 'Financial Controller', 'subscribe', 'subscription', 'chat',
 ]
 MAX_BYTES = 300_000  # Only fetch first ~300KB of the page for speed
 
