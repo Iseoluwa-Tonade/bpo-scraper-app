@@ -4,7 +4,9 @@ from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 import pandas as pd
-import json
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from playwright.sync_api import sync_playwright, Playwright, TimeoutError as PlaywrightTimeoutError
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
@@ -14,159 +16,231 @@ st.set_page_config(
 )
 
 # --- CONFIG & CONSTANTS ---
+# Refined keyword list to be more efficient and avoid redundancy.
+# The regex will handle variations.
 KEYWORDS = [
-    'bpo', 'business process outsourcing', 'customer', 'CX', 'support', 'CSAT',
-    'Chief Customer', 'Head of Customer', 'VP of Customer', 'Director of Support',
-    'Chief Customer Officer', 'VP of Support & Service Operations', 'Chief Customer Officer (CCO)',
-    'Chief Experience Officer (CXO)', 'Vice President (VP) of Customer Support', 'VP of Customer Service',
-    'VP of Customer Experience', 'Head of Customer Support', 'Head of Customer Service',
-    'Head of Customer Experience', 'Director of Customer Support', 'Director of Customer Service',
-    'Director of Customer Experience', 'Director of Support Operations', 'Director of Customer Care',
-    'Head of Support Operations', 'VP of Customer Care', 'Director of Client Services',
-    'Director of Support Strategy', 'Director of Procurement', 'Head of Procurement',
-    'Vice President (VP) of Procurement', 'Chief Procurement Officer (CPO)', 'Senior Procurement Manager',
-    'Director of Sourcing', 'Head of Strategic Sourcing', 'VP of Strategic Sourcing',
-    'Director of Purchasing', 'Head of Global Sourcing', 'VP of Purchasing',
-    'Director of Vendor Management', 'Head of Vendor Management', 'VP of Vendor Management',
-    'Chief Vendor Management Officer', 'Director of Supplier Management',
-    'Head of Supplier Relationship Management', 'VP of Supplier Management', 'Senior Vendor Relationship Manager',
-    'Director of Partner Management', 'CFO (Chief Financial Officer)',
-    'VP of Financial Planning & Analysis (FP&A)', 'VP of Corporate Finance', 'Head of Finance',
-    'Head of FP&A', 'Head of Corporate Finance', 'Director of Finance',
-    'Director of Financial Planning & Analysis', 'Director of Corporate Finance',
-    'Controller', 'Financial Controller', 'subscribe', 'subscription', 'chat',
+    'bpo', 'business process outsourcing', 'customer', 'cx', 'support', 'csat',
+    'chief customer', 'head of customer', 'vp of customer', 'director of support',
+    'chief experience officer', 'c-x-o', # for CXO
+    'vp of support', 'vp of service', 'vp of experience', 'vp of care',
+    'head of support', 'head of service', 'head of experience', 'head of care',
+    'director of customer', 'director of support', 'director of service', 'director of experience',
+    'director of care', 'director of client services',
+    'procurement', 'cpo', 'chief procurement officer', 'sourcing',
+    'purchasing', 'vendor management', 'supplier management', 'partner management',
+    'cfo', 'chief financial officer', 'fp&a', 'financial planning',
+    'controller', 'subscribe', 'subscription', 'chat'
 ]
-MAX_BYTES = 300_000  # Only fetch first ~300KB of the page for speed
+# Compile keywords into a single regex pattern for efficiency
+# \b ensures we match whole words only. re.IGNORECASE makes it case-insensitive.
+KEYWORD_PATTERN = re.compile(r'\b(' + '|'.join(re.escape(kw) for kw in KEYWORDS) + r')\b', re.IGNORECASE)
 
-# --- CORE FUNCTIONS ---
+# --- CACHED RESOURCES ---
 
-@st.cache_resource(ttl=3600) # Cache the connection for an hour
+@st.cache_resource(ttl=3600)
 def authenticate_google_sheets():
     """Authenticates with Google Sheets using Streamlit's Secrets."""
     try:
-        # Get the credentials from Streamlit's secrets
         creds_json = st.secrets["gcp_service_account"]
-        
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive"
         ]
-        creds = Credentials.from_service_account_info(
-            creds_json,
-            scopes=scopes
-        )
+        creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
         client = gspread.authorize(creds)
         return client
     except Exception as e:
-        st.error(f"Google Sheets authentication failed. Have you added your service account credentials to the Streamlit Secrets? Error: {e}")
+        st.error(f"Google Sheets authentication failed: {e}. Ensure 'gcp_service_account' is in your Streamlit Secrets.")
         return None
 
-def clean_domain(domain):
-    """Ensure proper domain format and avoid double https:// errors."""
+@st.cache_resource(ttl=3600)
+def get_requests_session():
+    """Returns a cached requests.Session object."""
+    return requests.Session()
+
+# --- CORE FUNCTIONS ---
+
+def clean_domain(domain: str) -> str | None:
+    """Cleans and formats a domain string to a full URL."""
     domain = domain.strip()
     if not domain:
         return None
-    domain = domain.replace("https://https://", "https://")
-    domain = domain.replace("http://https://", "https://")
-
-    if domain.startswith("http://") or domain.startswith("https://"):
+    # Avoid creating invalid URLs like https://https://example.com
+    if domain.startswith(('http://', 'https://')):
         return domain
-    else:
-        return f"https://{domain}"
+    return f"https://{domain}"
 
-def scrape_website(domain):
-    """Scrapes a single website for keywords."""
+def process_html_for_keywords(html_content: str) -> str:
+    """Parses HTML, extracts text, and finds keywords using regex."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    # Remove tags that typically contain no useful, unique content
+    for tag in soup(["script", "style", "noscript", "nav", "footer", "header"]):
+        tag.decompose()
+
+    text = soup.get_text(separator=" ", strip=True)
+    found_keywords = sorted(list(set(KEYWORD_PATTERN.findall(text.lower()))))
+
+    if found_keywords:
+        return "YES: " + ", ".join(found_keywords)
+    return "NO"
+
+def scrape_page_fast(domain: str, session: requests.Session) -> str:
+    """Scrapes a single website using the fast 'requests' method."""
     url = clean_domain(domain)
     if not url:
         return "Empty Domain"
     try:
-        with requests.Session() as s:
-            with s.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}, stream=True) as r:
-                r.raise_for_status()
-                html = b""
-                for chunk in r.iter_content(chunk_size=8192):
-                    html += chunk
-                    if len(html) > MAX_BYTES:
-                        break
-
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "noscript", "nav", "footer", "header"]):
-            tag.decompose()
-        text = soup.get_text(separator=" ", strip=True).lower()
-        found_keywords = sorted(list(set([kw for kw in KEYWORDS if kw.lower() in text])))
-        if found_keywords:
-            return "YES: " + ", ".join(found_keywords)
-        else:
-            return "NO"
+        # Use stream=True and iter_content to avoid downloading huge files
+        with session.get(
+            url,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"},
+            stream=True
+        ) as r:
+            r.raise_for_status()
+            html = r.content[:500_000] # Read up to 500KB
+        return process_html_for_keywords(html)
     except requests.exceptions.RequestException as e:
         return f"Error: Connection failed ({type(e).__name__})"
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"Error: {e}"
 
-def update_sheet(sheet, results):
-    """Updates a specific column in the Google Sheet with results."""
-    if not results: return
+def scrape_page_deep(domain: str, playwright: Playwright) -> str:
+    """Scrapes a single website using the deep 'Playwright' method to render JS."""
+    url = clean_domain(domain)
+    if not url:
+        return "Empty Domain"
     try:
-        cell_range = f"B2:B{len(results)+1}"
-        cells_to_update = sheet.range(cell_range)
-        for i, cell in enumerate(cells_to_update):
-            cell.value = results[i]
-        sheet.update_cells(cells_to_update, value_input_option='RAW')
+        browser = playwright.chromium.connect_over_cdp("ws://127.0.0.1:9222/") if "CI" in os.environ else playwright.chromium.launch()
+        context = browser.new_context(
+            user_agent="Mozilla/5.0",
+            java_script_enabled=True,
+            ignore_https_errors=True
+        )
+        page = context.new_page()
+        page.goto(url, timeout=25000, wait_until='domcontentloaded')
+        # Give the page a moment to run final JS scripts
+        page.wait_for_timeout(2000)
+        html = page.content()
+        page.close()
+        context.close()
+        browser.close()
+        return process_html_for_keywords(html)
+    except PlaywrightTimeoutError:
+        return "Error: Page load timed out"
+    except Exception as e:
+        return f"Error: Playwright failed ({type(e).__name__})"
+
+def update_sheet(sheet, results_df: pd.DataFrame):
+    """Updates a specific column in the Google Sheet with results."""
+    if results_df.empty:
+        return
+    try:
+        # Prepare the data for batch update (list of lists)
+        update_data = results_df[['Result']].values.tolist()
+        sheet.update(f'B2:B{len(update_data) + 1}', update_data, value_input_option='RAW')
     except Exception as e:
         st.error(f"Failed to update sheet: {e}")
 
-def load_domains(sheet):
+def load_domains(sheet) -> list[str]:
     """Loads a list of domains from the first column of the sheet."""
     try:
-        domains = sheet.col_values(1)[1:]
-        return [d for d in domains if d.strip()]
+        # Get all values from the first column, excluding the header
+        all_domains = sheet.col_values(1)[1:]
+        # Filter out any empty cells
+        return [d.strip() for d in all_domains if d.strip()]
     except Exception as e:
         st.error(f"Failed to load domains from sheet: {e}")
         return []
 
 # --- STREAMLIT UI ---
 st.title("🤖 BPO Keyword Scraper")
-st.markdown("This tool reads domains from a Google Sheet, scrapes each site for keywords, and writes the results back to the sheet.")
+st.markdown("This tool reads domains from a Google Sheet, scrapes each site for specific keywords, and writes the results back to the sheet.")
 
-with st.expander("⚙️ Configuration", expanded=True):
+with st.expander("⚙️ **Configuration**", expanded=True):
     sheet_name = st.text_input("1. Enter the name of your Google Sheet", "BPO Mentions Tracker")
     sheet_tab_index = st.number_input("2. Enter the sheet tab number (0 for first tab)", min_value=0, value=0)
+    scrape_mode = st.radio(
+        "3. Select Scraping Mode",
+        ('Deep', 'Fast'),
+        index=0,
+        horizontal=True,
+        help="**Deep Mode**: Slower but more accurate (renders JavaScript). **Fast Mode**: Quicker but may miss keywords on modern websites."
+    )
+    concurrency = st.slider(
+        "4. Set Parallel Workers",
+        min_value=1,
+        max_value=20,
+        value=10,
+        help="Number of websites to scrape simultaneously. Higher values are faster but use more resources."
+    )
 
-if st.button("🚀 Start Scraping", type="primary", disabled=(not sheet_name)):
+if st.button("🚀 Start Scraping", type="primary", use_container_width=True, disabled=(not sheet_name)):
     client = authenticate_google_sheets()
     if client:
         try:
             sheet = client.open(sheet_name).get_worksheet(sheet_tab_index)
-            st.info(f"Successfully connected to '{sheet_name}'.")
+            st.info(f"✅ Successfully connected to '{sheet_name}'.")
+
             domains = load_domains(sheet)
             if not domains:
-                st.warning("No domains found in Column A of your sheet.")
+                st.warning("⚠️ No domains found in Column A of your sheet.")
             else:
-                st.info(f"Found {len(domains)} domains. Starting scraping...")
-                results = []
+                st.info(f"Found {len(domains)} domains. Starting {scrape_mode.lower()} scrape with {concurrency} workers...")
+
+                results = {}
                 progress_bar = st.progress(0, text="Initializing...")
-                results_df = pd.DataFrame(columns=['Domain', 'Result'])
-                for i, domain in enumerate(domains):
-                    percent_complete = (i + 1) / len(domains)
-                    progress_bar.progress(percent_complete, text=f"({i+1}/{len(domains)}) Scraping: {domain}")
-                    result = scrape_website(domain)
-                    results.append(result)
-                    new_row = pd.DataFrame([{'Domain': domain, 'Result': result}])
-                    results_df = pd.concat([results_df, new_row], ignore_index=True)
-                
-                update_sheet(sheet, results)
-                progress_bar.progress(1.0, text="Process Complete!")
+
+                with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                    future_to_domain = {}
+                    if scrape_mode == 'Deep':
+                        # Using 'with' ensures Playwright is properly shut down
+                        with sync_playwright() as p:
+                            for domain in domains:
+                                future = executor.submit(scrape_page_deep, domain, p)
+                                future_to_domain[future] = domain
+                    else: # Fast mode
+                        session = get_requests_session()
+                        for domain in domains:
+                            future = executor.submit(scrape_page_fast, domain, session)
+                            future_to_domain[future] = domain
+
+                    completed_count = 0
+                    for future in as_completed(future_to_domain):
+                        domain = future_to_domain[future]
+                        try:
+                            results[domain] = future.result()
+                        except Exception as e:
+                            results[domain] = f"Error: Future failed ({e})"
+                        completed_count += 1
+                        percent_complete = completed_count / len(domains)
+                        progress_bar.progress(percent_complete, text=f"({completed_count}/{len(domains)}) Scraped: {domain}")
+
+                progress_bar.progress(1.0, text="Scraping complete! Updating Google Sheet...")
+
+                # Reorder results to match the original domain list
+                ordered_results = [results.get(domain, "Error: Not processed") for domain in domains]
+                results_df = pd.DataFrame({'Domain': domains, 'Result': ordered_results})
+
+                update_sheet(sheet, results_df)
                 st.success("✅ Done! The Google Sheet has been updated.")
                 st.balloons()
 
                 st.subheader("📊 Scraping Results")
                 def style_results(val):
-                    color = '#28a745' if "YES" in val else ('#dc3545' if "Error" in val else 'white')
+                    color = 'white' # Default color for "NO"
+                    if isinstance(val, str):
+                        if "YES" in val:
+                            color = '#28a745' # Green
+                        elif "Error" in val:
+                            color = '#dc3545' # Red
                     return f'color: {color};'
+
                 st.dataframe(results_df.style.applymap(style_results, subset=['Result']), use_container_width=True)
+
         except gspread.exceptions.SpreadsheetNotFound:
-            st.error(f"Spreadsheet '{sheet_name}' not found. Check the name and that your service account has access.")
+            st.error(f"❌ Spreadsheet '{sheet_name}' not found. Check the name and that your service account has access.")
         except gspread.exceptions.WorksheetNotFound:
-            st.error(f"Worksheet tab {sheet_tab_index} not found in '{sheet_name}'.")
+            st.error(f"❌ Worksheet tab {sheet_tab_index} not found in '{sheet_name}'.")
         except Exception as e:
             st.error(f"An unexpected error occurred: {e}")
