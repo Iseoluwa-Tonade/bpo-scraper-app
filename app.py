@@ -110,7 +110,7 @@ def scrape_page_deep(domain: str, playwright: Playwright) -> str:
     url = clean_domain(domain)
     if not url:
         return "Empty Domain"
-    
+
     browser = None # Initialize browser to None
     try:
         # Launch the browser with arguments for cloud environments
@@ -123,7 +123,8 @@ def scrape_page_deep(domain: str, playwright: Playwright) -> str:
             ignore_https_errors=True
         )
         page = context.new_page()
-        page.goto(url, timeout=30000, wait_until='domcontentloaded')
+        # Increased timeout to 60 seconds for slower sites
+        page.goto(url, timeout=60000, wait_until='domcontentloaded')
         # Give the page a moment for any lazy-loaded content
         page.wait_for_timeout(2500)
         html = page.content()
@@ -178,8 +179,8 @@ with st.expander("⚙️ **Configuration**", expanded=True):
         "4. Set Parallel Workers",
         min_value=1,
         max_value=20,
-        value=10,
-        help="Number of websites to scrape simultaneously. Higher values are faster but use more resources."
+        value=5,
+        help="Number of websites to scrape simultaneously. Start with a low number (like 3-5) to avoid memory errors."
     )
 
 if st.button("🚀 Start Scraping", type="primary", use_container_width=True, disabled=(not sheet_name)):
