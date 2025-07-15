@@ -110,26 +110,33 @@ def scrape_page_deep(domain: str, playwright: Playwright) -> str:
     url = clean_domain(domain)
     if not url:
         return "Empty Domain"
+    
+    browser = None # Initialize browser to None
     try:
-        browser = playwright.chromium.connect_over_cdp("ws://127.0.0.1:9222/") if "CI" in os.environ else playwright.chromium.launch()
+        # Launch the browser with arguments for cloud environments
+        browser = playwright.chromium.launch(
+            args=["--no-sandbox", "--disable-setuid-sandbox"]
+        )
         context = browser.new_context(
-            user_agent="Mozilla/5.0",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             java_script_enabled=True,
             ignore_https_errors=True
         )
         page = context.new_page()
-        page.goto(url, timeout=25000, wait_until='domcontentloaded')
-        # Give the page a moment to run final JS scripts
-        page.wait_for_timeout(2000)
+        page.goto(url, timeout=30000, wait_until='domcontentloaded')
+        # Give the page a moment for any lazy-loaded content
+        page.wait_for_timeout(2500)
         html = page.content()
-        page.close()
-        context.close()
-        browser.close()
         return process_html_for_keywords(html)
     except PlaywrightTimeoutError:
         return "Error: Page load timed out"
     except Exception as e:
+        # Provide a more specific error message
         return f"Error: Playwright failed ({type(e).__name__})"
+    finally:
+        # Ensure the browser is always closed to free up resources
+        if browser:
+            browser.close()
 
 def update_sheet(sheet, results_df: pd.DataFrame):
     """Updates a specific column in the Google Sheet with results."""
